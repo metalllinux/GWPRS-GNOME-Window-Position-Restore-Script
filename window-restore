@@ -1,0 +1,514 @@
+#!/bin/bash
+#
+# window-restore - GNOME Window Position Restore
+#
+# Saves the on-screen geometry of every open window across a GNOME/X11
+# desktop on a rolling basis, and restores that geometry automatically
+# when it detects the connected-monitor configuration has changed (a
+# proxy for a sleep/wake or monitor reconnect event), plus manual
+# save/restore commands for on-demand use.
+#
+# X11 only. GNOME on Wayland does not expose the window-geometry and
+# monitor-query interfaces this script relies on (wmctrl, xrandr), so
+# select "Standard (X11 display server)" at the GDM login screen.
+
+set -u
+
+# $USER is set by every normal GDM/GNOME login session, but is not
+# guaranteed by bash or POSIX itself; a stripped invocation environment
+# (e.g. `su -c` without a full login shell) can leave it unset. Since
+# this whole script is fundamentally per-user (every path below reads
+# or writes a file named after this value), fail over to `id -un`
+# rather than let `set -u` abort with "unbound variable" the moment
+# $USER is referenced.
+USER="${USER:-$(id -un)}"
+
+SAVE_FILE="$HOME/.window-positions"
+LOG_FILE="/tmp/window-restore-${USER}.log"
+MONITOR_STATE_FILE="/tmp/window-restore-monitors-${USER}"
+
+# Every file this script writes is private to the invoking user: saved/
+# logged window titles routinely include document names and URLs. umask
+# alone would only protect files created from this point forward (a
+# caller's shell can still override it, and it does nothing for a file
+# already left world-readable by an older, unfixed version of this
+# script), so each file below also gets an explicit chmod 600 right
+# after its first write in a given run, not just at script start.
+umask 077
+
+# LOG_FILE and MONITOR_STATE_FILE both live at fixed, per-user but
+# fully predictable paths under the world-writable /tmp (SAVE_FILE
+# doesn't have this problem: it lives under $HOME, which isn't
+# world-writable). A local user who knows or enumerates another
+# account's username can pre-plant a symlink at either exact path --
+# trivially right after boot, or right after monitor_loop's own
+# `rm -f "$MONITOR_STATE_FILE"` below -- and since install.sh deploys
+# this script to autostart unattended for every account at every
+# GNOME/X11 login, the victim never has to run anything by hand for
+# their own `window-restore monitor` process to write through that
+# symlink with their own privileges.
+#
+# claim_private_file reclaims $1 atomically whenever it is not already
+# a plain file owned by $USER: it stages a content-free file with
+# mktemp (mkstemp()'s O_CREAT|O_EXCL is itself immune to a pre-planted
+# symlink at that staging name) and then `mv -Tf`s it onto $1.
+# rename(2) replaces whatever dirent currently sits at the destination
+# -- symlink, device node, another user's file -- without ever
+# following it to read or write through its target, so a pre-planted
+# symlink can't redirect this write anywhere. Once our own file
+# occupies that path, /tmp's sticky bit stops any other local user
+# from deleting or renaming it out from under us, so this reclaim only
+# has to run again after the path has gone missing entirely (a reboot,
+# or monitor_loop's own `rm -f`), not on every call. If $1 is already a
+# plain file we own, this only re-asserts mode 600 and leaves its
+# content untouched: it must not truncate or replace a file that is
+# already safe, since log_message is called many times across a single
+# long-running `monitor` invocation, and a second window-restore
+# process (e.g. a manual `save` run while `monitor` is active) starts
+# with its own log_file_privatized flag back at 0 and must not blow
+# away that other process's history just because of that.
+claim_private_file() {
+    local path="$1" owner=""
+    if [ -f "$path" ] && [ ! -L "$path" ]; then
+        owner=$(stat -c '%U' "$path" 2>/dev/null || stat -f '%Su' "$path" 2>/dev/null)
+    fi
+    if [ "$owner" != "$USER" ]; then
+        local claim
+        claim=$(mktemp "${path}.XXXXXX")
+        chmod 600 "$claim"
+        # Clean up the staging file on a failed rename (e.g. a
+        # permissions problem) rather than leaving it behind, found
+        # while testing this fix rather than a previously known defect.
+        mv -Tf "$claim" "$path" || rm -f "$claim"
+    fi
+    chmod 600 "$path"
+}
+
+log_message() {
+    if [ "$log_file_privatized" -eq 0 ]; then
+        claim_private_file "$LOG_FILE"
+        log_file_privatized=1
+    fi
+    echo "[$(date '+%H:%M:%S')] $1" >> "$LOG_FILE"
+}
+log_file_privatized=0
+
+# Writes $1 into MONITOR_STATE_FILE via the same claim_private_file
+# reclaim used for LOG_FILE above, run before the content write (not
+# after), so a pre-existing world-readable or symlinked file is never
+# exposed to the new content even momentarily.
+write_monitor_state() {
+    claim_private_file "$MONITOR_STATE_FILE"
+    echo "$1" > "$MONITOR_STATE_FILE"
+}
+
+# X-offset marking where the "second" (rightmost) connected monitor
+# begins, derived from live xrandr geometry rather than a literal tied
+# to one specific rig's resolution. A window at or beyond this offset
+# classifies RIGHT; anything left of it classifies LEFT. For 3+
+# connected monitors this groups only the leftmost as LEFT and
+# everything else as RIGHT -- a documented limitation, not an attempt
+# at true N-monitor classification (see README).
+#
+# Recomputed on every call rather than cached, since check_monitor_change()
+# already detects and reacts to monitor reconfiguration; a boundary
+# cached across such a change would silently reintroduce the exact
+# wrong-for-this-rig bug this function replaces. The extra xrandr call
+# this costs per invocation is in line with the rest of the script,
+# which already calls xrandr multiple times per monitor_loop iteration.
+get_monitor_boundary() {
+    local offsets
+    offsets=$(xrandr --query 2>/dev/null | grep " connected" \
+        | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+' \
+        | awk -F'+' '{print $2}' | sort -n)
+
+    if [ "$(echo "$offsets" | grep -c .)" -lt 2 ]; then
+        # Fewer than two connected+active outputs (or xrandr itself is
+        # unavailable): no split is meaningful, so classify every
+        # window LEFT by returning a boundary nothing can reach.
+        echo 999999
+    else
+        # Second-lowest x-offset in sorted order is where the
+        # rightmost monitor begins.
+        echo "$offsets" | sed -n '2p'
+    fi
+}
+
+save_positions() {
+    log_message "Saving positions"
+    : > "$SAVE_FILE"
+    chmod 600 "$SAVE_FILE"
+
+    # Save wmctrl output to a temp file to avoid the subshell issue a
+    # `wmctrl ... | while read` pipeline would otherwise create (the
+    # loop's own variables, e.g. count, would live in a subshell and be
+    # lost once the pipeline exits). mktemp (rather than a predictable
+    # "$$"-suffixed name) avoids a symlink-attack surface in the
+    # world-writable /tmp directory: a local attacker who pre-creates a
+    # guessable path as a symlink could otherwise redirect this write
+    # wherever they chose. mktemp's own mkstemp()-backed creation is
+    # already mode 600 regardless of umask; the explicit chmod below is
+    # the same belt-and-suspenders treatment as every other file this
+    # script creates, applied consistently rather than assumed unneeded
+    # here specifically.
+    local temp_file
+    temp_file=$(mktemp /tmp/window-restore-wmctrl-output.XXXXXX)
+    chmod 600 "$temp_file"
+    wmctrl -l -G > "$temp_file"
+
+    local boundary
+    boundary=$(get_monitor_boundary)
+    count=0
+
+    # Process the temp file. Field order (id, desktop, x, y, width,
+    # height, hostname, title) matches `wmctrl -l -G`'s documented
+    # output (man wmctrl(1): "-G Include geometry information... four
+    # integer columns will follow: x-offset, y-offset, width and
+    # height. The next column always contains the client machine
+    # name. The remainder of the line contains the window title.").
+    # The hostname field is read into "_" because nothing in this
+    # script ever uses it; naming it "_" documents that the field is
+    # intentionally discarded rather than left as a silent dead
+    # variable.
+    while read -r win_id _ x y width height _ title; do
+        # Skip if no title or invalid position
+        [ -z "$title" ] && continue
+        [ "$x" = "-1" ] && continue
+
+        # Save to positions file
+        echo "${win_id}|${x}|${y}|${width}|${height}|${title}" >> "$SAVE_FILE"
+
+        # Log which monitor
+        if [ "$x" -ge "$boundary" ]; then
+            echo "  SAVED [RIGHT]: $title at x=$x"
+            log_message "  SAVED [RIGHT]: $title at x=$x"
+        else
+            echo "  SAVED [LEFT]: $title at x=$x"
+            log_message "  SAVED [LEFT]: $title at x=$x"
+        fi
+
+        ((count++))
+    done < "$temp_file"
+
+    rm -f "$temp_file"
+
+    echo "Saved $count window positions"
+    log_message "Actually saved $count positions to file"
+}
+
+# Given a saved window ID and its saved title, finds the matching
+# currently-open window ID. Tries the saved ID first: within a single
+# X session, window IDs are allocated by the X server from an
+# ever-increasing counter and are not reused while the session is
+# alive, so an exact ID match is unambiguous. This only succeeds for a
+# window that has stayed open (same identity) since the save; a window
+# that was closed and reopened gets a new ID, so this falls back to the
+# original title-based re-lookup, with the same first-match ambiguity
+# the original script had when two open windows share a title (see
+# README's known-limitations note; opening two windows with matching
+# titles, then closing and reopening one, exercises this fallback
+# path).
+find_current_window_id() {
+    local saved_id="$1" saved_title="$2" candidate
+
+    # `--` before the pattern in both grep calls below stops a window
+    # title (or, defensively, a saved ID) that happens to start with
+    # "-" from being parsed as a grep option instead of as the search
+    # text -- window titles are attacker-influenceable (any window's
+    # _NET_WM_NAME), so this can't be assumed to always look like a
+    # plain string. `head -1` on the ID branch mirrors the title
+    # branch's own cap: window IDs shouldn't repeat within a live X
+    # session, but if one ever did, a multi-line match here would flow
+    # into the caller's `wmctrl -i -r` as a single argument containing
+    # an embedded newline instead of failing the same defensive way the
+    # title branch already does.
+    if [ -n "$saved_id" ]; then
+        candidate=$(wmctrl -l | awk '{print $1}' | grep -xF -- "$saved_id" | head -1)
+        if [ -n "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    fi
+
+    wmctrl -l | grep -F -- "$saved_title" | head -1 | awk '{print $1}'
+}
+
+# Looks up a currently-open window's current x-offset by ID. Shared by
+# restore_positions() and check_and_restore(), which both otherwise
+# re-look-up "this window's current position" independently.
+get_current_window_x() {
+    wmctrl -l -G | grep -- "^$1" | awk '{print $3}'
+}
+
+restore_positions() {
+    if [ ! -f "$SAVE_FILE" ]; then
+        echo "No saved positions found for user $USER"
+        log_message "No saved positions file"
+        return 1
+    fi
+
+    echo "Restoring window positions..."
+    log_message "Starting restore"
+    restored=0
+    failed=0
+    local boundary
+    boundary=$(get_monitor_boundary)
+
+    while IFS='|' read -r saved_id saved_x saved_y saved_w saved_h saved_title; do
+        # Skip empty lines
+        [ -z "$saved_title" ] && continue
+
+        # Find window by ID first, title as fallback (see
+        # find_current_window_id above)
+        current_id=$(find_current_window_id "$saved_id" "$saved_title")
+
+        if [ -n "$current_id" ]; then
+            # Get current position
+            current_x=$(get_current_window_x "$current_id")
+
+            log_message "  Restoring '$saved_title': current x=$current_x -> target x=$saved_x"
+
+            # Move window to saved position
+            if wmctrl -i -r "$current_id" -e "0,${saved_x},${saved_y},${saved_w},${saved_h}"; then
+                if [ "$saved_x" -ge "$boundary" ]; then
+                    echo "  RESTORED to RIGHT: $saved_title"
+                    log_message "  RESTORED to RIGHT: $saved_title"
+                else
+                    echo "  RESTORED to LEFT: $saved_title"
+                    log_message "  RESTORED to LEFT: $saved_title"
+                fi
+                ((restored++))
+            else
+                log_message "  FAILED to restore: $saved_title"
+                ((failed++))
+            fi
+        else
+            log_message "  Window not found: $saved_title"
+        fi
+    done < "$SAVE_FILE"
+
+    echo "Restored $restored windows (failed: $failed)"
+    log_message "Restored $restored windows, Failed $failed"
+}
+
+get_monitor_state() {
+    # Get current monitor configuration as a string
+    xrandr --query 2>/dev/null | grep " connected" | awk '{print $1":"$2":"$3}' | sort | tr '\n' '|'
+}
+
+check_monitor_change() {
+    current_state=$(get_monitor_state)
+
+    if [ -f "$MONITOR_STATE_FILE" ]; then
+        previous_state=$(cat "$MONITOR_STATE_FILE")
+
+        if [ "$current_state" != "$previous_state" ]; then
+            log_message "MONITOR CHANGE DETECTED!"
+            log_message "  Previous: $previous_state"
+            log_message "  Current:  $current_state"
+
+            # Check if we now have 2+ monitors (wake event). `grep -c`
+            # already prints a literal "0" on zero matches (including
+            # on empty input, e.g. no xrandr on PATH), so no `|| echo 0`
+            # fallback is needed -- one was here before and produced a
+            # spurious two-line "0\n0" on a genuinely zero-monitor
+            # machine, which bash then choked on as a malformed integer.
+            monitor_count=$(xrandr --query 2>/dev/null | grep -c " connected")
+            if [ "$monitor_count" -ge 2 ]; then
+                log_message "Monitors reconnected/woke - forcing restore in 3 seconds"
+                sleep 3
+                restore_positions
+            fi
+        fi
+    fi
+
+    # Save current state
+    write_monitor_state "$current_state"
+}
+
+check_and_restore() {
+    # Don't check if no saved positions
+    [ ! -f "$SAVE_FILE" ] && return
+
+    moved_count=0
+    moved_list=""
+    local boundary
+    boundary=$(get_monitor_boundary)
+
+    while IFS='|' read -r saved_id saved_x saved_y saved_w saved_h saved_title; do
+        # Skip empty lines
+        [ -z "$saved_title" ] && continue
+
+        # Should this window be on right monitor?
+        if [ "$saved_x" -ge "$boundary" ]; then
+            # Get current position, preferring the ID match (see
+            # find_current_window_id) so a same-titled window on the
+            # other monitor cannot be mistaken for this one.
+            current_id=$(find_current_window_id "$saved_id" "$saved_title")
+            current_x=""
+            [ -n "$current_id" ] && current_x=$(get_current_window_x "$current_id")
+
+            # Has it moved to left monitor?
+            if [ -n "$current_x" ] && [ "$current_x" -lt "$boundary" ]; then
+                ((moved_count++))
+                moved_list="${moved_list} '$saved_title'"
+                log_message "  Wrong monitor: $saved_title (at x=$current_x, should be x=$saved_x)"
+            fi
+        fi
+    done < "$SAVE_FILE"
+
+    # Restore if ANY window moved (threshold = 1)
+    if [ "$moved_count" -ge 1 ]; then
+        log_message "DETECTED: $moved_count window(s) on wrong monitor:${moved_list}"
+        log_message "AUTO-RESTORING (threshold = 1 window)"
+        restore_positions
+    fi
+}
+
+monitor_loop() {
+    echo "Window monitor starting for user $USER..."
+    # check_and_restore() only ever inspects entries saved as RIGHT
+    # (saved_x -ge boundary) and only flags them if they've since
+    # drifted LEFT; a window saved LEFT that drifts RIGHT is never
+    # evaluated at all. State that asymmetry plainly rather than the
+    # symmetric-sounding claim this banner used to make.
+    echo "Will restore if a window saved on the RIGHT monitor moves to the LEFT monitor"
+    echo "Check log at: $LOG_FILE"
+    log_message "Monitor loop started (aggressive mode - restore on 1 window)"
+    log_message "Save interval: 30 seconds"
+
+    # Clear any old monitor state
+    rm -f "$MONITOR_STATE_FILE"
+
+    # Wait for desktop to fully load
+    sleep 10
+
+    # Initial save
+    log_message "Performing initial save..."
+    save_positions
+
+    # If no windows saved, wait and try again
+    if [ ! -s "$SAVE_FILE" ]; then
+        log_message "No windows detected, waiting 10s and retrying..."
+        sleep 10
+        save_positions
+    fi
+
+    # Save initial monitor state
+    write_monitor_state "$(get_monitor_state)"
+    log_message "Initial monitor state: $(cat "$MONITOR_STATE_FILE")"
+
+    # Track save intervals
+    save_counter=0
+
+    while true; do
+        sleep 5
+
+        ((save_counter++))
+
+        # Check for monitor changes FIRST (most important)
+        check_monitor_change
+
+        # Auto-save every 6 loops (30 seconds)
+        if [ "$save_counter" -ge 6 ]; then
+            log_message "Auto-saving positions (30s interval)"
+            save_positions
+            save_counter=0
+        fi
+
+        # Check if windows need restoring (see the note above on why
+        # there's no `|| echo 0` fallback here)
+        monitor_count=$(xrandr --query 2>/dev/null | grep -c " connected")
+
+        if [ "$monitor_count" -ge 2 ]; then
+            check_and_restore
+        else
+            if [ "$monitor_count" -eq 0 ]; then
+                log_message "WARNING: No monitors detected!"
+            fi
+        fi
+    done
+}
+
+print_usage() {
+    echo "Window Restore - System-wide version"
+    echo "Usage: $(basename "$0") {save|restore|monitor|status|debug|help}"
+    echo ""
+    echo "  save    - Save current window positions"
+    echo "  restore - Restore saved positions"
+    echo "  monitor - Run continuously (auto-save every 30s)"
+    echo "  status  - Show current status"
+    echo "  debug   - Show debug information"
+    echo "  help    - Show this usage information"
+    echo ""
+    echo "Settings: Restore on 1+ window move, auto-save every 30s"
+}
+
+# Main script
+case "${1:-}" in
+    save)
+        save_positions
+        ;;
+    restore)
+        restore_positions
+        ;;
+    monitor)
+        monitor_loop
+        ;;
+    status)
+        echo "Window Restore Status:"
+        if [ -f "$SAVE_FILE" ]; then
+            count=$(wc -l < "$SAVE_FILE" 2>/dev/null || echo 0)
+            echo "  Saved positions: $count windows"
+            echo "  Save file: $SAVE_FILE"
+        else
+            echo "  No saved positions"
+        fi
+        if pgrep -f "window-restore monitor" > /dev/null; then
+            echo "  Monitor: Running (PID: $(pgrep -f 'window-restore monitor'))"
+        else
+            echo "  Monitor: Not running"
+        fi
+        if [ -f "$MONITOR_STATE_FILE" ]; then
+            echo "  Monitor state: $(cat "$MONITOR_STATE_FILE")"
+        fi
+        echo "  Log file: $LOG_FILE"
+        if [ -f "$LOG_FILE" ]; then
+            echo "  Last log entry: $(tail -1 "$LOG_FILE")"
+        fi
+        ;;
+    debug)
+        echo "=== Window Restore Debug ==="
+        echo "Current windows:"
+        boundary=$(get_monitor_boundary)
+        wmctrl -l -G | while read -r _ _ x y _ _ _ title; do
+            if [ "$x" -ge "$boundary" ]; then
+                echo "  [RIGHT] $title at x=$x"
+            else
+                echo "  [LEFT]  $title at x=$x"
+            fi
+        done
+        echo ""
+        echo "Monitor configuration:"
+        xrandr --query | grep " connected"
+        echo ""
+        if [ -f "$SAVE_FILE" ]; then
+            echo "Saved positions:"
+            while IFS='|' read -r _ x y _ _ title; do
+                if [ "$x" -ge "$boundary" ]; then
+                    echo "  [RIGHT] $title at x=$x"
+                else
+                    echo "  [LEFT]  $title at x=$x"
+                fi
+            done < "$SAVE_FILE"
+        fi
+        ;;
+    help|--help|-h)
+        print_usage
+        exit 0
+        ;;
+    *)
+        print_usage
+        exit 1
+        ;;
+esac
