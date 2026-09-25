@@ -2,10 +2,6 @@
 
 Copyright (c) 2026, Ctrl IQ, Inc. All rights reserved.
 
-*This notice is provisional. Its exact wording comes from CIQ's internal copyright policy, which is
-itself marked `PROVISIONAL` pending confirmation from CIQ's Open Source Program Office, and needs
-human confirmation before this repository is published. The script was originally developed at CIQ.*
-
 ```text
 Copyright © 2026 Ctrl IQ, Inc.
 
