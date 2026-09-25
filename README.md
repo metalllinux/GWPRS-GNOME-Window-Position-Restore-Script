@@ -3,8 +3,12 @@
 `window-restore` is a Bash utility for GNOME on X11 that continuously tracks the on-screen position
 of every open window and restores those positions automatically when it detects that your monitor
 configuration has changed, for example after a laptop sleeps and wakes with an external display
-reconnected. It exists to work around a long-standing GNOME/X11 bug where windows land on the wrong
-monitor after the screen unlocks or a display reconnects.
+reconnected.
+
+It exists to work around a long-standing GNOME/X11 bug where windows land on the wrong monitor after
+the screen unlocks or a display reconnects. The issue was originally observed on Rocky Linux 8.10
+running GNOME on X11, on a dual-monitor desktop with an NVIDIA RTX A2000 GPU driving two Dell
+monitors.
 
 ## The bug this works around
 
