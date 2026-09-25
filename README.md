@@ -8,7 +8,7 @@ reconnected.
 It exists to work around a long-standing GNOME/X11 bug where windows land on the wrong monitor after
 the screen unlocks or a display reconnects. The issue was originally observed on Rocky Linux 8.10
 running GNOME on X11, on a dual-monitor desktop with an NVIDIA RTX A2000 GPU driving two Dell
-monitors.
+P2715Q monitors.
 
 ## The bug this works around
 
